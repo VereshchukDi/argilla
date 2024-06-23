@@ -1,0 +1,123 @@
+name: Build and publish the `argilla` sdk python package
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+
+  push:
+
+jobs:
+  build:
+    services:
+      argilla-quickstart:
+        image: argilla/argilla-quickstart:main
+        ports:
+          - 6900:6900
+        env:
+          ANNOTATOR_USERNAME: annotator
+          OWNER_USERNAME: argilla
+          OWNER_API_KEY: argilla.apikey
+          ADMIN_USERNAME: admin
+          ADMIN_API_KEY: admin.apikey
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: argilla
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup PDM
+        uses: pdm-project/setup-pdm@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: true
+          cache-dependency-path: |
+            argilla/pdm.lock
+      - name: Install dependencies
+        run: |
+          pdm install
+      - name: Wait for argilla-quickstart to start
+        run: |
+          while ! curl -XGET http://localhost:6900/api/_status; do sleep 5; done
+      - name: Run unit tests
+        run: |
+          pdm run test tests/unit
+      - name: Run integration tests
+        run: |
+          pdm run test tests/integration
+      - name: Build package
+        run: |
+          pdm build
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        # Upload the package to be used in the next jobs only once
+        if: ${{ matrix.python-version == '3.8' }}
+        with:
+          name: argilla
+          path: argilla/dist
+
+  # This job will publish argilla package into PyPI repository
+  publish_release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+
+    permissions:
+      # This permission is needed for private repositories.
+      # contents: read
+      # IMPORTANT: this permission is mandatory for trusted publishing on PyPI
+      id-token: write
+      # This permission is needed for creating tags
+      contents: write
+
+    needs:
+      - build
+
+    defaults:
+      run:
+        shell: bash -l {0}
+        working-directory: argilla
+
+    steps:
+      - name: Checkout Code 🛎
+        uses: actions/checkout@v4
+
+      - name: Download python package
+        uses: actions/download-artifact@v4
+        with:
+          name: argilla
+          path: argilla/dist
+
+      - name: Setup PDM
+        uses: pdm-project/setup-pdm@v4
+        with:
+          cache: true
+          python-version-file: argilla/pyproject.toml
+          cache-dependency-path: |
+            argilla/pdm.lock
+
+      - name: Read package info
+        run: |
+          PACKAGE_VERSION=$(pdm show --version)
+          PACKAGE_NAME=$(pdm show --name)
+          echo "PACKAGE_VERSION=$PACKAGE_VERSION" >> $GITHUB_ENV
+          echo "PACKAGE_NAME=$PACKAGE_NAME" >> $GITHUB_ENV
+          echo "$PACKAGE_NAME==$PACKAGE_VERSION"
+
+      - name: Publish Package to PyPI test environment 🥪
+        run: pdm publish --no-build --repository testpypi
+        continue-on-error: true
+
+      - name: Test Installing 🍿
+        run: |
+          pip install --index-url https://test.pypi.org/simple --no-deps  $PACKAGE_NAME==$PACKAGE_VERSION
+
+      - name: Publish Package to PyPI 🥩
+        if: github.ref == 'refs/heads/main'
+        run: pdm publish --no-build
